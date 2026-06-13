@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Screen Share - Phase 1 (live camera)</title>
+  <style>
+    body {
+      margin: 0; padding: 16px; background: #111; color: #eee;
+      font-family: system-ui, sans-serif;
+      display: flex; flex-direction: column; align-items: center; gap: 12px;
+    }
+    video {
+      width: 100%; max-width: 640px; background: #000; border-radius: 8px;
+    }
+    button {
+      font-size: 18px; padding: 12px 24px; border: none; border-radius: 8px;
+      background: #2dd76f; color: #04210f; font-weight: 700;
+    }
+    #status { font-size: 14px; min-height: 20px; text-align: center; }
+  </style>
+</head>
+<body>
+  <h2>Phase 1: live camera</h2>
+  <button id="startBtn">Start camera</button>
+  <!-- playsinline keeps iOS from forcing fullscreen; autoplay + muted let it start. -->
+  <video id="video" playsinline autoplay muted></video>
+  <p id="status">Tap "Start camera" and allow camera access.</p>
+
+  <script>
+    const video = document.getElementById("video");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+
+    async function startCamera() {
+      statusEl.textContent = "Requesting camera...";
+      try {
+        // facingMode "environment" asks for the rear camera (the one you point
+        // at the laptop screen). The browser shows a permission prompt first.
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+        statusEl.textContent = "Camera running. Point it at your laptop screen.";
+        startBtn.style.display = "none";
+      } catch (err) {
+        // Most common causes: page not served over HTTPS, or permission denied.
+        statusEl.textContent = "Could not start camera: " + err.name + " - " + err.message;
+      }
+    }
+
+    startBtn.addEventListener("click", startCamera);
+  </script>
+</body>
+</html>
