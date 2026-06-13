@@ -7,7 +7,345 @@
   <style>
     body {
       margin: 0; padding: 16px; background: #111; color: #eee;
+      font-family: system-ui, sans-serif;<!DOCTYPE html><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Screen Share - Phase 2 (live detection)</title>
+  <style>
+    body {
+      margin: 0; padding: 16px; background: #111; color: #eee;
       font-family: system-ui, sans-serif;
+      display: flex; flex-direction: column; align-items: center; gap: 12px;
+    }
+    canvas { width: 100%; max-width: 640px; background: #000; border-radius: 8px; }
+    /* The video is the source only; keep it alive but off-screen, not display:none
+       (which can make iOS pause it). */
+    video { position: fixed; top: 0; left: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+    button {
+      font-size: 18px; padding: 12px 24px; border: none; border-radius: 8px;
+      background: #2dd76f; color: #04210f; font-weight: 700;
+    }
+    button:disabled { background: #444; color: #999; }
+    #status { font-size: 14px; min-height: 20px; text-align: center; max-width: 640px; }
+  </style>
+</head>
+<body>
+  <h2>Phase 2: live screen detection</h2>
+  <button id="startBtn" disabled>Loading vision library...</button>
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="view"></canvas>
+  <p id="status">Loading OpenCV (about 8 MB on first open)...</p>
+
+  <!-- OpenCV.js loads asynchronously; onload fires once the file is fetched. -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const view = document.getElementById("view");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const ctx = view.getContext("2d", { willReadFrequently: true });
+
+    const PROC_W = 640;          // processing width; height set from video aspect
+    let cvReady = false;
+    let streaming = false;
+    let KERNEL = null;           // dilation kernel, created once
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    // --- Wait for the OpenCV runtime, across the different build styles ---
+    function onOpenCvReady() {
+      const check = () => {
+        if (window.cv && cv.Mat && cv.imread) { onCvReady(); }
+        else if (window.cv && typeof cv.then === "function") {
+          cv.then((m) => { window.cv = m; onCvReady(); });
+        } else { setTimeout(check, 50); }
+      };
+      check();
+    }
+
+    function onCvReady() {
+      cvReady = true;
+      KERNEL = cv.Mat.ones(3, 3, cv.CV_8U);
+      startBtn.disabled = false;
+      startBtn.textContent = "Start camera";
+      setStatus('Ready. Tap "Start camera" and allow access.');
+    }
+
+    // --- Camera ---
+    async function startCamera() {
+      if (!cvReady) return;
+      setStatus("Requesting camera...");
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+
+        // Size the canvas to the video's aspect ratio at our processing width.
+        const ratio = (video.videoHeight || 480) / (video.videoWidth || 640);
+        view.width = PROC_W;
+        view.height = Math.round(PROC_W * ratio);
+
+        streaming = true;
+        startBtn.style.display = "none";
+        setStatus("Detecting. Point the camera at your laptop screen.");
+        requestAnimationFrame(processVideo);
+      } catch (err) {
+        setStatus("Could not start camera: " + err.name + " - " + err.message);
+      }
+    }
+
+    // --- One frame: read, detect, draw ---
+    function processVideo() {
+      if (!streaming) return;
+      try {
+        ctx.drawImage(video, 0, 0, view.width, view.height);
+        const src = cv.imread(view);     // canvas -> RGBA Mat
+        detectAndDraw(src);              // draws outline onto src in place
+        cv.imshow(view, src);            // Mat -> canvas (frame + overlay)
+        src.delete();
+      } catch (err) {
+        setStatus("Processing error: " + err.message);
+        streaming = false;
+        return;
+      }
+      requestAnimationFrame(processVideo);
+    }
+
+    // --- The detection pipeline (same logic as the Python version) ---
+    function detectAndDraw(src) {
+      const gray = new cv.Mat();
+      const blurred = new cv.Mat();
+      const edges = new cv.Mat();
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+      const approx = new cv.Mat();
+
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);            // brightness only
+      cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);  // remove fine noise
+      cv.Canny(blurred, edges, 50, 150);                     // mark sharp edges
+      cv.dilate(edges, edges, KERNEL);                       // close small gaps
+      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      const frameArea = src.cols * src.rows;
+      let bestArea = 0;
+      let bestCorners = null;
+
+      for (let i = 0; i < contours.size(); i++) {
+        const c = contours.get(i);
+        const area = cv.contourArea(c);
+        if (area > 0.10 * frameArea && area > bestArea) {
+          const peri = cv.arcLength(c, true);
+          cv.approxPolyDP(c, approx, 0.02 * peri, true);     // simplify to corners
+          if (approx.rows === 4 && cv.isContourConvex(approx)) {
+            const pts = [];
+            for (let j = 0; j < 4; j++) {
+              pts.push([approx.data32S[j * 2], approx.data32S[j * 2 + 1]]);
+            }
+            bestArea = area;
+            bestCorners = pts;
+          }
+        }
+        c.delete();
+      }
+
+      if (bestCorners) {
+        const green = new cv.Scalar(0, 255, 0, 255);
+        const red = new cv.Scalar(255, 0, 0, 255);
+        for (let j = 0; j < 4; j++) {
+          const p1 = new cv.Point(bestCorners[j][0], bestCorners[j][1]);
+          const p2 = new cv.Point(bestCorners[(j + 1) % 4][0], bestCorners[(j + 1) % 4][1]);
+          cv.line(src, p1, p2, green, 2);
+        }
+        for (let j = 0; j < 4; j++) {
+          cv.circle(src, new cv.Point(bestCorners[j][0], bestCorners[j][1]), 5, red, -1);
+        }
+      }
+
+      // Free every Mat we created this frame (WASM has no garbage collector).
+      gray.delete(); blurred.delete(); edges.delete();
+      contours.delete(); hierarchy.delete(); approx.delete();
+    }
+
+    startBtn.addEventListener("click", startCamera);
+  </script>
+</body>
+</html>
+
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Screen Share - Phase 2 (live detection)</title>
+  <style>
+    body {
+      margin: 0; padding: 16px; background: #111; color: #eee;
+      font-family: system-ui, sans-serif;
+      display: flex; flex-direction: column; align-items: center; gap: 12px;
+    }
+    canvas { width: 100%; max-width: 640px; background: #000; border-radius: 8px; }
+    /* The video is the source only; keep it alive but off-screen, not display:none
+       (which can make iOS pause it). */
+    video { position: fixed; top: 0; left: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+    button {
+      font-size: 18px; padding: 12px 24px; border: none; border-radius: 8px;
+      background: #2dd76f; color: #04210f; font-weight: 700;
+    }
+    button:disabled { background: #444; color: #999; }
+    #status { font-size: 14px; min-height: 20px; text-align: center; max-width: 640px; }
+  </style>
+</head>
+<body>
+  <h2>Phase 2: live screen detection</h2>
+  <button id="startBtn" disabled>Loading vision library...</button>
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="view"></canvas>
+  <p id="status">Loading OpenCV (about 8 MB on first open)...</p>
+
+  <!-- OpenCV.js loads asynchronously; onload fires once the file is fetched. -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const view = document.getElementById("view");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const ctx = view.getContext("2d", { willReadFrequently: true });
+
+    const PROC_W = 640;          // processing width; height set from video aspect
+    let cvReady = false;
+    let streaming = false;
+    let KERNEL = null;           // dilation kernel, created once
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    // --- Wait for the OpenCV runtime, across the different build styles ---
+    function onOpenCvReady() {
+      const check = () => {
+        if (window.cv && cv.Mat && cv.imread) { onCvReady(); }
+        else if (window.cv && typeof cv.then === "function") {
+          cv.then((m) => { window.cv = m; onCvReady(); });
+        } else { setTimeout(check, 50); }
+      };
+      check();
+    }
+
+    function onCvReady() {
+      cvReady = true;
+      KERNEL = cv.Mat.ones(3, 3, cv.CV_8U);
+      startBtn.disabled = false;
+      startBtn.textContent = "Start camera";
+      setStatus('Ready. Tap "Start camera" and allow access.');
+    }
+
+    // --- Camera ---
+    async function startCamera() {
+      if (!cvReady) return;
+      setStatus("Requesting camera...");
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+
+        // Size the canvas to the video's aspect ratio at our processing width.
+        const ratio = (video.videoHeight || 480) / (video.videoWidth || 640);
+        view.width = PROC_W;
+        view.height = Math.round(PROC_W * ratio);
+
+        streaming = true;
+        startBtn.style.display = "none";
+        setStatus("Detecting. Point the camera at your laptop screen.");
+        requestAnimationFrame(processVideo);
+      } catch (err) {
+        setStatus("Could not start camera: " + err.name + " - " + err.message);
+      }
+    }
+
+    // --- One frame: read, detect, draw ---
+    function processVideo() {
+      if (!streaming) return;
+      try {
+        ctx.drawImage(video, 0, 0, view.width, view.height);
+        const src = cv.imread(view);     // canvas -> RGBA Mat
+        detectAndDraw(src);              // draws outline onto src in place
+        cv.imshow(view, src);            // Mat -> canvas (frame + overlay)
+        src.delete();
+      } catch (err) {
+        setStatus("Processing error: " + err.message);
+        streaming = false;
+        return;
+      }
+      requestAnimationFrame(processVideo);
+    }
+
+    // --- The detection pipeline (same logic as the Python version) ---
+    function detectAndDraw(src) {
+      const gray = new cv.Mat();
+      const blurred = new cv.Mat();
+      const edges = new cv.Mat();
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+      const approx = new cv.Mat();
+
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);            // brightness only
+      cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);  // remove fine noise
+      cv.Canny(blurred, edges, 50, 150);                     // mark sharp edges
+      cv.dilate(edges, edges, KERNEL);                       // close small gaps
+      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      const frameArea = src.cols * src.rows;
+      let bestArea = 0;
+      let bestCorners = null;
+
+      for (let i = 0; i < contours.size(); i++) {
+        const c = contours.get(i);
+        const area = cv.contourArea(c);
+        if (area > 0.10 * frameArea && area > bestArea) {
+          const peri = cv.arcLength(c, true);
+          cv.approxPolyDP(c, approx, 0.02 * peri, true);     // simplify to corners
+          if (approx.rows === 4 && cv.isContourConvex(approx)) {
+            const pts = [];
+            for (let j = 0; j < 4; j++) {
+              pts.push([approx.data32S[j * 2], approx.data32S[j * 2 + 1]]);
+            }
+            bestArea = area;
+            bestCorners = pts;
+          }
+        }
+        c.delete();
+      }
+
+      if (bestCorners) {
+        const green = new cv.Scalar(0, 255, 0, 255);
+        const red = new cv.Scalar(255, 0, 0, 255);
+        for (let j = 0; j < 4; j++) {
+          const p1 = new cv.Point(bestCorners[j][0], bestCorners[j][1]);
+          const p2 = new cv.Point(bestCorners[(j + 1) % 4][0], bestCorners[(j + 1) % 4][1]);
+          cv.line(src, p1, p2, green, 2);
+        }
+        for (let j = 0; j < 4; j++) {
+          cv.circle(src, new cv.Point(bestCorners[j][0], bestCorners[j][1]), 5, red, -1);
+        }
+      }
+
+      // Free every Mat we created this frame (WASM has no garbage collector).
+      gray.delete(); blurred.delete(); edges.delete();
+      contours.delete(); hierarchy.delete(); approx.delete();
+    }
+
+    startBtn.addEventListener("click", startCamera);
+  </script>
+</body>
+</html>
+
       display: flex; flex-direction: column; align-items: center; gap: 12px;
     }
     video {
