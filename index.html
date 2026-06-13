@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Screen Share - Phase 2 (stable detection)</title>
+  <style>
+    body { margin:0; padding:16px; background:#111; color:#eee; font-family:system-ui,sans-serif;
+           display:flex; flex-direction:column; align-items:center; gap:12px; }
+    canvas { width:100%; max-width:640px; background:#000; border-radius:8px; }
+    video { position:fixed; top:0; left:0; width:2px; height:2px; opacity:0; pointer-events:none; }
+    button { font-size:18px; padding:12px 24px; border:none; border-radius:8px;
+             background:#2dd76f; color:#04210f; font-weight:700; }
+    button:disabled { background:#444; color:#999; }
+    #status { font-size:14px; min-height:20px; text-align:center; max-width:640px; }
+  </style>
+</head>
+<body>
+  <h2>Phase 2: stable screen detection</h2>
+  <button id="startBtn" disabled>Loading vision library...</button>
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="view"></canvas>
+  <p id="status">Loading OpenCV (about 8 MB on first open)...</p>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const view = document.getElementById("view");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const ctx = view.getContext("2d", { willReadFrequently: true });
+
+    // ---- Tunable knobs (adjust if it rejects the screen or grabs the keyboard) ----
+    const PROC_W = 640;          // processing width (smaller = faster, less detail)
+    const MIN_AREA_FRAC = 0.10;  // screen must cover at least this fraction of the frame
+    const ASPECT_MIN = 1.30;     // reject shapes too square
+    const ASPECT_MAX = 2.40;     // reject shapes too wide/short (e.g. the keyboard deck)
+    const SMOOTH_ALPHA = 0.35;   // 0..1: higher = snappier, lower = smoother/steadier
+    const MAX_JUMP_FRAC = 0.25;  // ignore a detection that jumps more than this * frame diagonal
+    const HOLD_FRAMES = 10;      // keep the last box for this many missed/ignored frames
+
+    let cvReady = false, streaming = false, KERNEL = null;
+    let lastCorners = null, missCount = 0;
+
+    function setStatus(m){ statusEl.textContent = m; }
+
+    // ---- OpenCV runtime readiness (wait for the real init signal) ----
+    function onOpenCvReady(){
+      if(!window.cv){ setTimeout(onOpenCvReady,50); return; }
+      if(typeof cv.then === "function"){ cv.then(m=>{ window.cv=m; onCvReady(); }); }
+      else if(cv.calledRun){ onCvReady(); }
+      else { cv["onRuntimeInitialized"] = onCvReady; }
+    }
+    function onCvReady(){
+      try{
+        KERNEL = cv.Mat.ones(3,3,cv.CV_8U);
+        cvReady = true;
+        startBtn.disabled = false;
+        startBtn.textContent = "Start camera";
+        setStatus('Ready. Tap "Start camera" and allow access.');
+      }catch(err){ setStatus("OpenCV failed to start: " + err.message + ". Try Safari."); }
+    }
+
+    // ---- Camera ----
+    async function startCamera(){
+      if(!cvReady) return;
+      setStatus("Requesting camera...");
+      try{
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video:{ facingMode:"environment" }, audio:false });
+        video.srcObject = stream;
+        await video.play();
+        const ratio = (video.videoHeight || 480) / (video.videoWidth || 640);
+        view.width = PROC_W;
+        view.height = Math.round(PROC_W * ratio);
+        streaming = true;
+        startBtn.style.display = "none";
+        setStatus("Detecting. Point the camera at your laptop screen.");
+        requestAnimationFrame(processVideo);
+      }catch(err){ setStatus("Could not start camera: " + err.name + " - " + err.message); }
+    }
+
+    // ---- Geometry helpers (validated separately in node) ----
+    function dist(a,b){ return Math.hypot(b[0]-a[0], b[1]-a[1]); }
+    function orderCorners(pts){
+      const sum = p=>p[0]+p[1], diff = p=>p[1]-p[0];
+      let tl=pts[0], br=pts[0], tr=pts[0], bl=pts[0];
+      for(const p of pts){
+        if(sum(p) < sum(tl)) tl=p;
+        if(sum(p) > sum(br)) br=p;
+        if(diff(p) < diff(tr)) tr=p;
+        if(diff(p) > diff(bl)) bl=p;
+      }
+      return [tl,tr,br,bl];
+    }
+    function quadAspect(o){
+      const w = (dist(o[0],o[1]) + dist(o[3],o[2])) / 2;
+      const h = (dist(o[0],o[3]) + dist(o[1],o[2])) / 2;
+      return Math.max(w,h) / Math.max(1, Math.min(w,h));
+    }
+    function emaCorners(prev,cur,a){
+      return prev.map((p,i)=>[p[0]*(1-a)+cur[i][0]*a, p[1]*(1-a)+cur[i][1]*a]);
+    }
+    function avgCornerDist(A,B){ let s=0; for(let i=0;i<4;i++) s+=dist(A[i],B[i]); return s/4; }
+
+    // ---- Detection: returns ordered corners [TL,TR,BR,BL] or null ----
+    function detectScreen(src){
+      const gray=new cv.Mat(), blurred=new cv.Mat(), edges=new cv.Mat();
+      const contours=new cv.MatVector(), hierarchy=new cv.Mat(), approx=new cv.Mat();
+
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, blurred, new cv.Size(5,5), 0);
+      cv.Canny(blurred, edges, 50, 150);
+      cv.dilate(edges, edges, KERNEL);
+      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      const frameArea = src.cols * src.rows;
+      let bestArea = 0, best = null;
+
+      for(let i=0;i<contours.size();i++){
+        const c = contours.get(i);
+        const area = cv.contourArea(c);
+        if(area > MIN_AREA_FRAC*frameArea && area > bestArea){
+          const peri = cv.arcLength(c, true);
+          cv.approxPolyDP(c, approx, 0.02*peri, true);
+          if(approx.rows === 4 && cv.isContourConvex(approx)){
+            const raw = [];
+            for(let j=0;j<4;j++) raw.push([approx.data32S[j*2], approx.data32S[j*2+1]]);
+            const o = orderCorners(raw);
+            const aspect = quadAspect(o);
+            if(aspect >= ASPECT_MIN && aspect <= ASPECT_MAX){
+              best = o; bestArea = area;
+            }
+          }
+        }
+        c.delete();
+      }
+
+      gray.delete(); blurred.delete(); edges.delete();
+      contours.delete(); hierarchy.delete(); approx.delete();
+      return best;
+    }
+
+    // ---- Stability: smooth, hold through losses, ignore sudden jumps ----
+    function stabilize(cand, w, h){
+      if(cand){
+        if(lastCorners){
+          const jump = avgCornerDist(cand, lastCorners);
+          const maxJump = MAX_JUMP_FRAC * Math.hypot(w, h);
+          if(jump > maxJump && missCount < HOLD_FRAMES){
+            missCount++;                 // likely a jump to the keyboard; hold the last box
+            return lastCorners;
+          }
+        }
+        lastCorners = lastCorners ? emaCorners(lastCorners, cand, SMOOTH_ALPHA) : cand;
+        missCount = 0;
+        return lastCorners;
+      }
+      missCount++;
+      if(lastCorners && missCount < HOLD_FRAMES) return lastCorners;   // brief loss: hold
+      lastCorners = null;
+      return null;
+    }
+
+    function drawQuad(src, o){
+      const green = new cv.Scalar(0,255,0,255), red = new cv.Scalar(255,0,0,255);
+      for(let j=0;j<4;j++){
+        const p1 = new cv.Point(o[j][0], o[j][1]);
+        const p2 = new cv.Point(o[(j+1)%4][0], o[(j+1)%4][1]);
+        cv.line(src, p1, p2, green, 2);
+      }
+      for(let j=0;j<4;j++) cv.circle(src, new cv.Point(o[j][0], o[j][1]), 5, red, -1);
+    }
+
+    // ---- Per-frame loop ----
+    function processVideo(){
+      if(!streaming) return;
+      try{
+        ctx.drawImage(video, 0, 0, view.width, view.height);
+        const src = cv.imread(view);
+        const cand = detectScreen(src);
+        const shown = stabilize(cand, src.cols, src.rows);
+        if(shown) drawQuad(src, shown);
+        cv.imshow(view, src);
+        src.delete();
+      }catch(err){ setStatus("Processing error: " + err.message); streaming = false; return; }
+      requestAnimationFrame(processVideo);
+    }
+
+    startBtn.addEventListener("click", startCamera);
+  </script>
+</body>
+</html>
