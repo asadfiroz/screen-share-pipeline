@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Screen Share - Phase 3 (flatten)</title>
+  <style>
+    body { margin:0; padding:16px; background:#111; color:#eee; font-family:system-ui,sans-serif;
+           display:flex; flex-direction:column; align-items:center; gap:8px; }
+    canvas { width:100%; max-width:640px; background:#000; border-radius:8px; }
+    video { position:fixed; top:0; left:0; width:2px; height:2px; opacity:0; pointer-events:none; }
+    .label { font-size:13px; color:#9af; margin-top:8px; }
+    button { font-size:18px; padding:12px 24px; border:none; border-radius:8px;
+             background:#2dd76f; color:#04210f; font-weight:700; }
+    button:disabled { background:#444; color:#999; }
+    #status { font-size:14px; min-height:20px; text-align:center; max-width:640px; }
+  </style>
+</head>
+<body>
+  <h2>Phase 3: flatten the screen</h2>
+  <button id="startBtn" disabled>Loading vision library...</button>
+  <video id="video" playsinline autoplay muted></video>
+
+  <div class="label">Camera (detected screen outlined)</div>
+  <canvas id="view"></canvas>
+  <div class="label">Flattened screen (what gets shared)</div>
+  <canvas id="out"></canvas>
+  <canvas id="hi" style="display:none"></canvas>
+
+  <p id="status">Loading OpenCV (about 8 MB on first open)...</p>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const view = document.getElementById("view");
+    const out = document.getElementById("out");
+    const hi = document.getElementById("hi");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const hctx = hi.getContext("2d", { willReadFrequently: true });
+
+    // ---- Tunable knobs ----
+    const PROC_W = 640;            // detection width (fast, low detail)
+    const HI_W = 1280;             // warp-source width (sharper output; lower if choppy)
+    const OUTPUT_W = 1280, OUTPUT_H = 720;   // flattened output size (16:9)
+    const MIN_AREA_FRAC = 0.10;
+    const ASPECT_MIN = 1.30, ASPECT_MAX = 2.40;
+    const SMOOTH_ALPHA = 0.35;
+    const MAX_JUMP_FRAC = 0.25;
+    const HOLD_FRAMES = 10;
+
+    let cvReady = false, streaming = false, KERNEL = null, DST_TRI = null;
+    let lastCorners = null, missCount = 0;
+
+    function setStatus(m){ statusEl.textContent = m; }
+
+    function onOpenCvReady(){
+      if(!window.cv){ setTimeout(onOpenCvReady,50); return; }
+      if(typeof cv.then === "function"){ cv.then(m=>{ window.cv=m; onCvReady(); }); }
+      else if(cv.calledRun){ onCvReady(); }
+      else { cv["onRuntimeInitialized"] = onCvReady; }
+    }
+    function onCvReady(){
+      try{
+        KERNEL = cv.Mat.ones(3,3,cv.CV_8U);
+        DST_TRI = cv.matFromArray(4,1,cv.CV_32FC2,[0,0, OUTPUT_W-1,0, OUTPUT_W-1,OUTPUT_H-1, 0,OUTPUT_H-1]);
+        out.width = OUTPUT_W; out.height = OUTPUT_H;
+        cvReady = true;
+        startBtn.disabled = false;
+        startBtn.textContent = "Start camera";
+        setStatus('Ready. Tap "Start camera" and allow access.');
+      }catch(err){ setStatus("OpenCV failed to start: " + err.message + ". Try Safari."); }
+    }
+
+    async function startCamera(){
+      if(!cvReady) return;
+      setStatus("Requesting camera...");
+      try{
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video:{ facingMode:"environment", width:{ ideal:1920 }, height:{ ideal:1080 } },
+          audio:false });
+        video.srcObject = stream;
+        await video.play();
+        const ratio = (video.videoHeight || 1080) / (video.videoWidth || 1920);
+        view.width = PROC_W; view.height = Math.round(PROC_W * ratio);
+        hi.width = HI_W;     hi.height = Math.round(HI_W * ratio);
+        streaming = true;
+        startBtn.style.display = "none";
+        setStatus("Running. Point the camera at your laptop screen.");
+        requestAnimationFrame(processVideo);
+      }catch(err){ setStatus("Could not start camera: " + err.name + " - " + err.message); }
+    }
+
+    // ---- Geometry helpers (validated in node) ----
+    function dist(a,b){ return Math.hypot(b[0]-a[0], b[1]-a[1]); }
+    function orderCorners(pts){
+      const sum = p=>p[0]+p[1], diff = p=>p[1]-p[0];
+      let tl=pts[0], br=pts[0], tr=pts[0], bl=pts[0];
+      for(const p of pts){
+        if(sum(p) < sum(tl)) tl=p;
+        if(sum(p) > sum(br)) br=p;
+        if(diff(p) < diff(tr)) tr=p;
+        if(diff(p) > diff(bl)) bl=p;
+      }
+      return [tl,tr,br,bl];
+    }
+    function quadAspect(o){
+      const w = (dist(o[0],o[1]) + dist(o[3],o[2])) / 2;
+      const h = (dist(o[0],o[3]) + dist(o[1],o[2])) / 2;
+      return Math.max(w,h) / Math.max(1, Math.min(w,h));
+    }
+    function emaCorners(prev,cur,a){
+      return prev.map((p,i)=>[p[0]*(1-a)+cur[i][0]*a, p[1]*(1-a)+cur[i][1]*a]);
+    }
+    function avgCornerDist(A,B){ let s=0; for(let i=0;i<4;i++) s+=dist(A[i],B[i]); return s/4; }
+
+    // ---- Detection: ordered corners [TL,TR,BR,BL] or null ----
+    function detectScreen(src){
+      const gray=new cv.Mat(), blurred=new cv.Mat(), edges=new cv.Mat();
+      const contours=new cv.MatVector(), hierarchy=new cv.Mat(), approx=new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, blurred, new cv.Size(5,5), 0);
+      cv.Canny(blurred, edges, 50, 150);
+      cv.dilate(edges, edges, KERNEL);
+      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      const frameArea = src.cols * src.rows;
+      let bestArea = 0, best = null;
+      for(let i=0;i<contours.size();i++){
+        const c = contours.get(i);
+        const area = cv.contourArea(c);
+        if(area > MIN_AREA_FRAC*frameArea && area > bestArea){
+          const peri = cv.arcLength(c, true);
+          cv.approxPolyDP(c, approx, 0.02*peri, true);
+          if(approx.rows === 4 && cv.isContourConvex(approx)){
+            const raw = [];
+            for(let j=0;j<4;j++) raw.push([approx.data32S[j*2], approx.data32S[j*2+1]]);
+            const o = orderCorners(raw);
+            const aspect = quadAspect(o);
+            if(aspect >= ASPECT_MIN && aspect <= ASPECT_MAX){ best = o; bestArea = area; }
+          }
+        }
+        c.delete();
+      }
+      gray.delete(); blurred.delete(); edges.delete();
+      contours.delete(); hierarchy.delete(); approx.delete();
+      return best;
+    }
+
+    function stabilize(cand, w, h){
+      if(cand){
+        if(lastCorners){
+          const jump = avgCornerDist(cand, lastCorners);
+          if(jump > MAX_JUMP_FRAC*Math.hypot(w,h) && missCount < HOLD_FRAMES){
+            missCount++; return lastCorners;
+          }
+        }
+        lastCorners = lastCorners ? emaCorners(lastCorners, cand, SMOOTH_ALPHA) : cand;
+        missCount = 0;
+        return lastCorners;
+      }
+      missCount++;
+      if(lastCorners && missCount < HOLD_FRAMES) return lastCorners;
+      lastCorners = null;
+      return null;
+    }
+
+    function drawQuad(src, o){
+      const green = new cv.Scalar(0,255,0,255), red = new cv.Scalar(255,0,0,255);
+      for(let j=0;j<4;j++){
+        cv.line(src, new cv.Point(o[j][0],o[j][1]), new cv.Point(o[(j+1)%4][0],o[(j+1)%4][1]), green, 2);
+      }
+      for(let j=0;j<4;j++) cv.circle(src, new cv.Point(o[j][0],o[j][1]), 5, red, -1);
+    }
+
+    // ---- Warp the screen flat using corners in hi-res coordinates ----
+    function flatten(srcHi, cornersHi){
+      const srcTri = cv.matFromArray(4,1,cv.CV_32FC2,[
+        cornersHi[0][0],cornersHi[0][1], cornersHi[1][0],cornersHi[1][1],
+        cornersHi[2][0],cornersHi[2][1], cornersHi[3][0],cornersHi[3][1] ]);
+      const M = cv.getPerspectiveTransform(srcTri, DST_TRI);
+      const warped = new cv.Mat();
+      cv.warpPerspective(srcHi, warped, M, new cv.Size(OUTPUT_W, OUTPUT_H),
+                         cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0,0,0,255));
+      srcTri.delete(); M.delete();
+      return warped;
+    }
+
+    function processVideo(){
+      if(!streaming) return;
+      try{
+        hctx.drawImage(video, 0, 0, hi.width, hi.height);   // one hi-res capture
+        const srcHi = cv.imread(hi);
+        const srcLow = new cv.Mat();
+        cv.resize(srcHi, srcLow, new cv.Size(view.width, view.height));   // downscale for detection
+
+        const cand = detectScreen(srcLow);
+        const shown = stabilize(cand, srcLow.cols, srcLow.rows);
+        if(shown) drawQuad(srcLow, shown);
+        cv.imshow(view, srcLow);
+
+        if(shown){
+          const scale = hi.width / view.width;
+          const cornersHi = shown.map(p => [p[0]*scale, p[1]*scale]);
+          const warped = flatten(srcHi, cornersHi);
+          cv.imshow(out, warped);
+          warped.delete();
+        }
+
+        srcHi.delete(); srcLow.delete();
+      }catch(err){ setStatus("Processing error: " + err.message); streaming = false; return; }
+      requestAnimationFrame(processVideo);
+    }
+
+    startBtn.addEventListener("click", startCamera);
+  </script>
+</body>
+</html>
