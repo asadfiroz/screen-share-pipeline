@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Screen Share - Phase 4 (ML detection)</title>
+  <style>
+    body { margin:0; padding:16px; background:#111; color:#eee; font-family:system-ui,sans-serif;
+           display:flex; flex-direction:column; align-items:center; gap:8px; }
+    canvas { width:100%; max-width:640px; background:#000; border-radius:8px; }
+    video { position:fixed; top:0; left:0; width:2px; height:2px; opacity:0; pointer-events:none; }
+    .label { font-size:13px; color:#9af; margin-top:8px; }
+    button { font-size:18px; padding:12px 24px; border:none; border-radius:8px;
+             background:#2dd76f; color:#04210f; font-weight:700; }
+    button:disabled { background:#444; color:#999; }
+    #status { font-size:14px; min-height:20px; text-align:center; max-width:640px; }
+  </style>
+</head>
+<body>
+  <h2>Phase 4: ML detection</h2>
+  <button id="startBtn" disabled>Loading...</button>
+  <video id="video" playsinline autoplay muted></video>
+
+  <div class="label">Camera (detected screen outlined)</div>
+  <canvas id="view"></canvas>
+  <div class="label">Flattened screen (what gets shared)</div>
+  <canvas id="out"></canvas>
+  <canvas id="hi" style="display:none"></canvas>
+
+  <p id="status">Loading vision library and model...</p>
+
+  <!-- ONNX Runtime Web: loads before the main script so `ort` is defined -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js"></script>
+  <!-- OpenCV.js: still used for the warp + sharpen -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const view = document.getElementById("view");
+    const out = document.getElementById("out");
+    const hi = document.getElementById("hi");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const hctx = hi.getContext("2d", { willReadFrequently: true });
+
+    // ---- Tunable knobs ----
+    const PROC_W = 640;            // preview width + the space corners live in
+    const HI_W = 1600;             // warp-source width (sharper output; lower to 1280 if choppy)
+    const OUTPUT_W = 1280, OUTPUT_H = 720;
+    const MODEL_SIZE = 256;        // model input is 256x256 (must match training)
+    const MODEL_URL = "screen_corners.onnx";   // sits next to index.html in your repo
+    const INFER_INTERVAL_MS = 100; // run the model ~10x/sec (raise if the phone struggles)
+    const SMOOTH_ALPHA = 0.35;     // corner glide per frame (lower = smoother but laggier)
+    const ASPECT_MIN = 1.05, ASPECT_MAX = 3.2;  // reject obviously broken model outputs
+    const SHARPEN = true;
+    const SHARP_SIGMA = 3;
+    const SHARP_AMOUNT = 0.6;
+
+    let cvReady = false, modelReady = false, streaming = false;
+    let DST_TRI = null, session = null;
+    let targetCorners = null, displayedCorners = null;
+    let inferBusy = false, lastInfer = 0;
+
+    // 256x256 scratch canvas for building the model input
+    const mcanvas = document.createElement("canvas");
+    mcanvas.width = MODEL_SIZE; mcanvas.height = MODEL_SIZE;
+    const mctx = mcanvas.getContext("2d", { willReadFrequently: true });
+
+    function setStatus(m){ statusEl.textContent = m; }
+
+    function maybeEnableStart(){
+      if(cvReady && modelReady){
+        startBtn.disabled = false;
+        startBtn.textContent = "Start camera";
+        setStatus('Ready. Tap "Start camera" and allow access.');
+      } else {
+        setStatus(`Loading... OpenCV ${cvReady ? "ok" : "..."}, model ${modelReady ? "ok" : "..."}`);
+      }
+    }
+
+    // ---- OpenCV init (warp + sharpen) ----
+    function onOpenCvReady(){
+      if(!window.cv){ setTimeout(onOpenCvReady,50); return; }
+      if(typeof cv.then === "function"){ cv.then(m=>{ window.cv=m; onCvReady(); }); }
+      else if(cv.calledRun){ onCvReady(); }
+      else { cv["onRuntimeInitialized"] = onCvReady; }
+    }
+    function onCvReady(){
+      try{
+        DST_TRI = cv.matFromArray(4,1,cv.CV_32FC2,[0,0, OUTPUT_W-1,0, OUTPUT_W-1,OUTPUT_H-1, 0,OUTPUT_H-1]);
+        out.width = OUTPUT_W; out.height = OUTPUT_H;
+        cvReady = true; maybeEnableStart();
+      }catch(err){ setStatus("OpenCV failed to start: " + err.message + ". Try Safari."); }
+    }
+
+    // ---- Model init (ONNX Runtime Web) ----
+    async function loadModel(){
+      try{
+        if(!window.ort){ setStatus("Could not load ONNX Runtime. Check your connection."); return; }
+        ort.env.wasm.numThreads = 1;   // GitHub Pages is not cross-origin isolated
+        ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
+        // fetch the model ourselves with cache:"reload" so a stale/cached copy can't be served,
+        // and so a missing file reports a clear HTTP error instead of a cryptic parse error
+        const resp = await fetch(MODEL_URL, { cache: "reload" });
+        if(!resp.ok) throw new Error("HTTP " + resp.status + " fetching " + MODEL_URL);
+        const buf = new Uint8Array(await resp.arrayBuffer());
+        session = await ort.InferenceSession.create(buf, { executionProviders:["wasm"] });
+        modelReady = true; maybeEnableStart();
+      }catch(err){ setStatus("Model failed to load: " + err.message); }
+    }
+
+    async function startCamera(){
+      if(!cvReady || !modelReady) return;
+      setStatus("Requesting camera...");
+      try{
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video:{ facingMode:"environment", width:{ ideal:1920 }, height:{ ideal:1080 } },
+          audio:false });
+        video.srcObject = stream;
+        await video.play();
+        const ratio = (video.videoHeight || 1080) / (video.videoWidth || 1920);
+        view.width = PROC_W; view.height = Math.round(PROC_W * ratio);
+        hi.width = HI_W;     hi.height = Math.round(HI_W * ratio);
+        streaming = true;
+        startBtn.style.display = "none";
+        setStatus("Running. Point at a screen and fill the frame for the sharpest result.");
+        requestAnimationFrame(processVideo);
+      }catch(err){ setStatus("Could not start camera: " + err.name + " - " + err.message); }
+    }
+
+    // ---- Geometry helpers ----
+    function dist(a,b){ return Math.hypot(b[0]-a[0], b[1]-a[1]); }
+    function orderCorners(pts){
+      const sum = p=>p[0]+p[1], diff = p=>p[1]-p[0];
+      let tl=pts[0], br=pts[0], tr=pts[0], bl=pts[0];
+      for(const p of pts){
+        if(sum(p) < sum(tl)) tl=p;
+        if(sum(p) > sum(br)) br=p;
+        if(diff(p) < diff(tr)) tr=p;
+        if(diff(p) > diff(bl)) bl=p;
+      }
+      return [tl,tr,br,bl];
+    }
+    function quadAspect(o){
+      const w = (dist(o[0],o[1]) + dist(o[3],o[2])) / 2;
+      const h = (dist(o[0],o[3]) + dist(o[1],o[2])) / 2;
+      return Math.max(w,h) / Math.max(1, Math.min(w,h));
+    }
+    function emaCorners(prev,cur,a){
+      return prev.map((p,i)=>[p[0]*(1-a)+cur[i][0]*a, p[1]*(1-a)+cur[i][1]*a]);
+    }
+
+    // ---- Model inference: full frame -> 4 corners (in PROC_W/view space) ----
+    function frameToTensor(){
+      mctx.drawImage(video, 0, 0, MODEL_SIZE, MODEL_SIZE);   // squish full FOV into 256x256 (matches training)
+      const data = mctx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data;  // RGBA
+      const plane = MODEL_SIZE * MODEL_SIZE;
+      const f = new Float32Array(3 * plane);
+      for(let i=0;i<plane;i++){
+        f[i]           = data[i*4]     / 255;  // R
+        f[i + plane]   = data[i*4 + 1] / 255;  // G
+        f[i + 2*plane] = data[i*4 + 2] / 255;  // B
+      }
+      return new ort.Tensor("float32", f, [1, 3, MODEL_SIZE, MODEL_SIZE]);
+    }
+
+    async function runInference(){
+      if(!session || inferBusy || !streaming) return;
+      inferBusy = true;
+      try{
+        const input = frameToTensor();
+        const results = await session.run({ [session.inputNames[0]]: input });
+        const o = results[session.outputNames[0]].data;   // 8 normalized coords
+        const pts = [];
+        for(let k=0;k<4;k++) pts.push([ o[k*2] * view.width, o[k*2+1] * view.height ]);
+        const ordered = orderCorners(pts);
+        const asp = quadAspect(ordered);
+        if(asp >= ASPECT_MIN && asp <= ASPECT_MAX) targetCorners = ordered;  // else keep last good
+      }catch(err){ /* transient: keep the last target */ }
+      inferBusy = false;
+    }
+
+    // ---- Warp + sharpen (unchanged) ----
+    function sharpen(mat){
+      const blur = new cv.Mat();
+      cv.GaussianBlur(mat, blur, new cv.Size(0,0), SHARP_SIGMA);
+      cv.addWeighted(mat, 1 + SHARP_AMOUNT, blur, -SHARP_AMOUNT, 0, mat);
+      blur.delete();
+    }
+    function flatten(srcHi, cornersHi){
+      const srcTri = cv.matFromArray(4,1,cv.CV_32FC2,[
+        cornersHi[0][0],cornersHi[0][1], cornersHi[1][0],cornersHi[1][1],
+        cornersHi[2][0],cornersHi[2][1], cornersHi[3][0],cornersHi[3][1] ]);
+      const M = cv.getPerspectiveTransform(srcTri, DST_TRI);
+      const warped = new cv.Mat();
+      cv.warpPerspective(srcHi, warped, M, new cv.Size(OUTPUT_W, OUTPUT_H),
+                         cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0,0,0,255));
+      srcTri.delete(); M.delete();
+      return warped;
+    }
+    function drawQuad(src, o){
+      const green = new cv.Scalar(0,255,0,255), red = new cv.Scalar(255,0,0,255);
+      for(let j=0;j<4;j++)
+        cv.line(src, new cv.Point(o[j][0],o[j][1]), new cv.Point(o[(j+1)%4][0],o[(j+1)%4][1]), green, 2);
+      for(let j=0;j<4;j++) cv.circle(src, new cv.Point(o[j][0],o[j][1]), 5, red, -1);
+    }
+
+    // ---- Main loop: render every frame, infer on a throttle ----
+    function processVideo(){
+      if(!streaming) return;
+      try{
+        const now = performance.now();
+        if(now - lastInfer > INFER_INTERVAL_MS){ lastInfer = now; runInference(); }  // async, non-blocking
+
+        hctx.drawImage(video, 0, 0, hi.width, hi.height);
+        const srcHi = cv.imread(hi);
+        const srcLow = new cv.Mat();
+        cv.resize(srcHi, srcLow, new cv.Size(view.width, view.height));
+
+        if(targetCorners){
+          displayedCorners = displayedCorners
+            ? emaCorners(displayedCorners, targetCorners, SMOOTH_ALPHA)
+            : targetCorners;
+        }
+        if(displayedCorners){
+          const scale = hi.width / view.width;
+          const cornersHi = displayedCorners.map(p => [p[0]*scale, p[1]*scale]);
+          const warped = flatten(srcHi, cornersHi);   // warp from the clean hi-res frame
+          if(SHARPEN) sharpen(warped);
+          cv.imshow(out, warped);
+          warped.delete();
+          drawQuad(srcLow, displayedCorners);          // outline on the preview only
+        }
+        cv.imshow(view, srcLow);
+
+        srcHi.delete(); srcLow.delete();
+      }catch(err){ setStatus("Processing error: " + err.message); streaming = false; return; }
+      requestAnimationFrame(processVideo);
+    }
+
+    startBtn.addEventListener("click", startCamera);
+    loadModel();   // start loading the model immediately, in parallel with OpenCV
+  </script>
+</body>
+</html>
