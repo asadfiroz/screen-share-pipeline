@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Capture real training data</title>
+  <style>
+    body { margin:0; padding:16px; background:#111; color:#eee; font-family:system-ui,sans-serif;
+           display:flex; flex-direction:column; align-items:center; gap:10px; }
+    canvas { width:100%; max-width:640px; background:#000; border-radius:8px; }
+    video { position:fixed; top:0; left:0; width:2px; height:2px; opacity:0; pointer-events:none; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+    button { font-size:17px; padding:11px 20px; border:none; border-radius:8px; font-weight:700; }
+    #startBtn { background:#2dd76f; color:#04210f; }
+    #capBtn { background:#3b82f6; color:#fff; }
+    #dlBtn  { background:#eab308; color:#1a1500; }
+    button:disabled { background:#444; color:#999; }
+    #status { font-size:14px; min-height:20px; text-align:center; max-width:640px; }
+    #count { font-size:15px; color:#9af; font-weight:700; }
+  </style>
+</head>
+<body>
+  <h2>Capture real training data</h2>
+  <button id="startBtn" disabled>Loading...</button>
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="view"></canvas>
+  <div class="row">
+    <button id="capBtn" disabled>Capture</button>
+    <button id="dlBtn" disabled>Download dataset (0)</button>
+  </div>
+  <div id="count">captured: 0</div>
+  <p id="status">Loading vision library...</p>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const view = document.getElementById("view");
+    const startBtn = document.getElementById("startBtn");
+    const capBtn = document.getElementById("capBtn");
+    const dlBtn = document.getElementById("dlBtn");
+    const statusEl = document.getElementById("status");
+    const countEl = document.getElementById("count");
+
+    const PROC_W = 640;
+    // classical-detector knobs (only capture clean, confident detections)
+    const MIN_AREA_FRAC = 0.12;     // screen must fill >=12% of the frame
+    const ASPECT_MIN = 1.25, ASPECT_MAX = 2.2;
+
+    let cvReady = false, streaming = false;
+    let currentQuad = null;         // detected quad this frame (view coords) or null
+    const captures = [];            // { blob, label[8] }
+
+    // clean frame canvas (no overlay) used for detection + saving
+    const cap = document.createElement("canvas");
+    const cctx = cap.getContext("2d", { willReadFrequently: true });
+    const vctx = view.getContext("2d");
+
+    function setStatus(m){ statusEl.textContent = m; }
+
+    function onOpenCvReady(){
+      if(!window.cv){ setTimeout(onOpenCvReady,50); return; }
+      if(typeof cv.then === "function"){ cv.then(m=>{ window.cv=m; onCvReady(); }); }
+      else if(cv.calledRun){ onCvReady(); }
+      else { cv["onRuntimeInitialized"] = onCvReady; }
+    }
+    function onCvReady(){
+      cvReady = true; startBtn.disabled = false; startBtn.textContent = "Start camera";
+      setStatus('Ready. Tap "Start camera" and allow access.');
+    }
+
+    async function startCamera(){
+      if(!cvReady) return;
+      setStatus("Requesting camera...");
+      try{
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video:{ facingMode:"environment", width:{ ideal:1920 }, height:{ ideal:1080 } }, audio:false });
+        video.srcObject = stream; await video.play();
+        const ratio = (video.videoHeight || 1080) / (video.videoWidth || 1920);
+        view.width = PROC_W; view.height = Math.round(PROC_W * ratio);
+        cap.width = view.width; cap.height = view.height;
+        streaming = true;
+        startBtn.style.display = "none";
+        setStatus("Point so the screen fills the frame. Green = locked, then tap Capture.");
+        requestAnimationFrame(loop);
+      }catch(err){ setStatus("Could not start camera: " + err.name + " - " + err.message); }
+    }
+
+    // ---- geometry ----
+    function dist(a,b){ return Math.hypot(b[0]-a[0], b[1]-a[1]); }
+    function orderCorners(pts){
+      const sum=p=>p[0]+p[1], diff=p=>p[1]-p[0];
+      let tl=pts[0],br=pts[0],tr=pts[0],bl=pts[0];
+      for(const p of pts){ if(sum(p)<sum(tl))tl=p; if(sum(p)>sum(br))br=p; if(diff(p)<diff(tr))tr=p; if(diff(p)>diff(bl))bl=p; }
+      return [tl,tr,br,bl];
+    }
+    function quadAspect(o){
+      const w=(dist(o[0],o[1])+dist(o[3],o[2]))/2, h=(dist(o[0],o[3])+dist(o[1],o[2]))/2;
+      return Math.max(w,h)/Math.max(1,Math.min(w,h));
+    }
+
+    // ---- classical detector (the one that works when the screen is prominent) ----
+    function detectClassical(src){
+      const gray=new cv.Mat(), blur=new cv.Mat(), edges=new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, blur, new cv.Size(5,5), 0);
+      cv.Canny(blur, edges, 50, 150);
+      const k=cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3,3));
+      cv.dilate(edges, edges, k);
+      const contours=new cv.MatVector(), hier=new cv.Mat();
+      cv.findContours(edges, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      const frameArea = src.rows * src.cols;
+      let best=null, bestArea=0;
+      for(let i=0;i<contours.size();i++){
+        const c=contours.get(i);
+        const approx=new cv.Mat();
+        cv.approxPolyDP(c, approx, 0.02*cv.arcLength(c,true), true);
+        if(approx.rows===4 && cv.isContourConvex(approx)){
+          const area=cv.contourArea(approx);
+          if(area > frameArea*MIN_AREA_FRAC && area > bestArea){
+            const pts=[];
+            for(let j=0;j<4;j++) pts.push([approx.data32S[j*2], approx.data32S[j*2+1]]);
+            const o=orderCorners(pts), a=quadAspect(o);
+            if(a>=ASPECT_MIN && a<=ASPECT_MAX){ best=o; bestArea=area; }
+          }
+        }
+        approx.delete(); c.delete();
+      }
+      gray.delete(); blur.delete(); edges.delete(); k.delete(); contours.delete(); hier.delete();
+      return best;
+    }
+
+    function loop(){
+      if(!streaming) return;
+      cctx.drawImage(video, 0, 0, cap.width, cap.height);     // clean frame
+      const src = cv.imread(cap);
+      currentQuad = detectClassical(src);
+      src.delete();
+
+      vctx.drawImage(cap, 0, 0);                               // show clean frame
+      if(currentQuad){
+        vctx.strokeStyle="#00ff00"; vctx.lineWidth=3; vctx.beginPath();
+        vctx.moveTo(currentQuad[0][0], currentQuad[0][1]);
+        for(let j=1;j<4;j++) vctx.lineTo(currentQuad[j][0], currentQuad[j][1]);
+        vctx.closePath(); vctx.stroke();
+        vctx.fillStyle="#ff3030";
+        for(const p of currentQuad){ vctx.beginPath(); vctx.arc(p[0],p[1],5,0,7); vctx.fill(); }
+      }
+      capBtn.disabled = !currentQuad;
+      requestAnimationFrame(loop);
+    }
+
+    function captureOne(){
+      if(!currentQuad) return;
+      const q = currentQuad;
+      const label = [];
+      for(const p of q){ label.push(p[0]/view.width, p[1]/view.height); }   // normalized TL,TR,BR,BL
+      cap.toBlob(blob=>{
+        captures.push({ blob, label });
+        countEl.textContent = "captured: " + captures.length;
+        dlBtn.disabled = false;
+        dlBtn.textContent = "Download dataset (" + captures.length + ")";
+      }, "image/png");
+    }
+
+    async function downloadDataset(){
+      if(!captures.length || !window.JSZip) return;
+      setStatus("Building zip...");
+      const zip = new JSZip();
+      const imgs = zip.folder("images");
+      let csv = "filename,x0,y0,x1,y1,x2,y2,x3,y3\n";
+      captures.forEach((c,i)=>{
+        const name = "img_" + String(i).padStart(5,"0") + ".png";
+        imgs.file(name, c.blob);
+        csv += name + "," + c.label.map(v=>v.toFixed(5)).join(",") + "\n";
+      });
+      zip.file("labels.csv", csv);
+      const blob = await zip.generateAsync({ type:"blob" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "real_dataset.zip";
+      a.click();
+      setStatus("Downloaded real_dataset.zip with " + captures.length + " labeled images.");
+    }
+
+    startBtn.addEventListener("click", startCamera);
+    capBtn.addEventListener("click", captureOne);
+    dlBtn.addEventListener("click", downloadDataset);
+  </script>
+</body>
+</html>
