@@ -9,13 +9,38 @@ Live demo: https://asadfiroz.github.io/screen-share-pipeline/
 
 (Open it on a phone, allow the camera, and point the back camera at a screen.)
 
-## The idea
+## Problem statement 
 
-Sometimes you cannot share your screen the normal way. A simple alternative is to
-point a phone camera at the screen. The problem is that a phone photo of a screen is
-tilted, warped, and hard to read. This project fixes that automatically: it finds the
-screen in the camera view and corrects it to a clean, head on, readable image in real
-time.
+Remote collaboration depends heavily on screen sharing, yet screen sharing is often
+unavailable. Corporate security policies, locked down or air gapped machines,
+examination settings, and legacy systems frequently block or do not support it. In
+these cases the only practical way to show a screen to a remote person is to capture it
+optically with a second device, such as a phone camera. An optical capture of a display
+is degraded by perspective distortion, variable lighting and glare, motion blur, and
+limited resolution, which makes the content hard to read.
+
+This project studies real time detection and rectification of a display surface from a
+handheld camera, performed entirely on device in a web browser, with no installed
+software and no server. The core technical task is to localize the four corners of a
+screen in a camera frame and then apply a homography that maps the screen to a flat,
+head on, readable view.
+
+## Approach and contributions
+
+- A fully client side, server free pipeline: camera capture, screen corner detection,
+  homography based rectification, and image enhancement, all running in the browser.
+- A small corner regression convolutional network exported to ONNX and run in the
+  browser with WebAssembly, so no specialized hardware or app install is needed.
+- A two part data strategy: a procedural generator that renders synthetic laptop scenes
+  with exact corner labels, and an auto labeling method that reuses a classical detector
+  to label real photographs with no manual annotation.
+
+This problem is related to document image rectification and quadrilateral document
+detection used in mobile document scanners. Screens differ from documents because they
+emit light, show arbitrary and changing content, have bezels, and produce glare and
+reflections, which motivates a learned detector built specifically for screens.
+
+
 
 ## How it works (the pipeline)
 
@@ -70,6 +95,21 @@ The model was trained on two kinds of data:
 The model was trained on both sets combined, which made it work much better on real
 screens than synthetic data alone.
 
+## How the model was trained (steps I followed)
+
+You will need: pip install opencv-python numpy pillow-heif (PyTorch is already installed in Google Colab).
+
+1. Generate synthetic data: put screenshots in a content/ folder and room photos in
+   a backgrounds/ folder, then run python generate_data.py. This builds thousands of
+   labeled fake-laptop images.
+2. Collect real data: open capture.html on a phone, point at a real screen, and tap
+   Capture whenever the outline locks on. The old classical detector auto labels each
+   shot. Download the result as real_dataset.zip.
+3. Train: in Google Colab (free GPU), upload the synthetic and real data and run
+   train_v2.py. It trains the corner-detection model and exports screen_corners.onnx.
+4. Deploy: put screen_corners.onnx next to index.html in this repo. The app loads it
+   automatically.
+
 ## Tech stack
 
 - App and inference: HTML, JavaScript, OpenCV.js (for the warp and sharpen),
@@ -90,8 +130,11 @@ screens than synthetic data alone.
 - `index.html` : the live app (camera, model, flatten, sharpen).
 - `capture.html` : tool used to collect and auto label real training images.
 - `generate_data.py` : creates the synthetic training data.
-- `train.py`, `train_v2.py`, `train_v3.py` : model training scripts.
+- `train.py`, `train_v2.py` : model training scripts.
 - `screen_corners.onnx` : the trained model used by the app.
+- `step1_capture.py`, `step2_detect.py` : the original Python
+  prototype (classical detection) before the browser version.
+- `requirements.txt` : Python packages for the prototype.
 
 ## Screenshots
 
@@ -99,9 +142,9 @@ Screen detected and outlined:
 
 ![Screen detected 1](detection-1.PNG)
 
-![Screen detected 2](https://github.com/asadfiroz/screen-share-pipeline/blob/main/Detection-2.PNG)
+![Screen detected 2](Detection-2.PNG)
 
-![Screen detected 3](https://github.com/asadfiroz/screen-share-pipeline/blob/main/Detection-3.PNG)
+![Screen detected 3](Detection-3.PNG)
 
 ## Current status
 
@@ -115,12 +158,27 @@ Known limitations:
 - It can still draw a box on a busy non screen scene, because the current model does
   not yet output a "screen present" confidence.
 
-## Future work
+## Future work & Research
 
-- Add a "screen present" confidence output so the box hides when there is no screen.
-- Collect more real data at harder angles and distances to tighten the corners.
-- Move the model to a background worker so the live video is smoother.
-- Try a pretrained backbone (such as MobileNet) for better accuracy.
+- Screen presence and confidence: add a presence output so the model reports a
+  probability that a screen is in view, and study how to set the threshold to balance
+  false detections against missed detections.
+- Closing the sim to real gap: grow the real data set across more devices, screen
+  contents, distances, angles, and lighting, and measure how accuracy scales with the
+  amount and diversity of real data versus synthetic data.
+- Architecture study: compare the current small network against a pretrained backbone
+  such as MobileNet, and against a segmentation based formulation, trading off accuracy
+  against on device latency.
+- Temporal modeling: use information across frames, such as tracking and smoothing, to
+  improve stability instead of treating each frame independently.
+- Robustness: evaluate and improve performance under glare, reflections, partial
+  occlusion, and multi monitor setups.
+- Evaluation protocol: define a held out real test set and report standard metrics such
+  as normalized corner localization error, intersection over union of the rectified
+  region, precision and recall for screen presence, and end to end latency on mobile
+  hardware.
+- Readability and enhancement: study super resolution and deblurring on the rectified
+  output to recover small text, and measure the readability gains.
 
 ## Note
 
