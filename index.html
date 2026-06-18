@@ -53,9 +53,9 @@
     const RENDER_INTERVAL_MS = 40; // cap heavy warp work to ~25 fps
     const SMOOTH_ALPHA = 0.35;     // corner glide per frame (lower = smoother but laggier)
     const ASPECT_MIN = 1.05, ASPECT_MAX = 3.2;  // reject obviously broken model outputs
-    const DETAIL_THRESH = 120;     // min "detail" inside the box to count as a screen (tune to your room)
+    const DETAIL_THRESH = 180;     // min "detail" inside the box to count as a screen (tune to your room)
     const HOLD_FRAMES = 6;         // low-detail frames before the box disappears
-    const SHOW_DETAIL = true;      // print the live detail value on screen (for tuning)
+    const SHOW_DETAIL = false ;      // print the live detail value on screen (for tuning)
     const SHARPEN = true;
     const SHARP_SIGMA = 2;
     const SHARP_AMOUNT = 0.5;
