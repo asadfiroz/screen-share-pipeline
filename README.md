@@ -97,7 +97,7 @@ screens than synthetic data alone.
 
 Screen detected and outlined:
 
-![Screen detected 1](https://github.com/asadfiroz/screen-share-pipeline/blob/main/detection-1.PNG)
+![Screen detected 1](detection-1.PNG)
 
 ![Screen detected 2](https://github.com/asadfiroz/screen-share-pipeline/blob/main/Detection-2.PNG)
 
